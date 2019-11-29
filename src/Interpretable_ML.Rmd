@@ -1,0 +1,264 @@
+---
+title: "Tools for Interpreting Machine Learning Models"
+subtitle: "Communities and Crime Example"
+author: "Christoph Kern"
+output: html_notebook
+---
+
+## Setup
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(ranger)
+library(iml)
+```
+
+## Data
+
+This notebook uses the Communities and Crime data from the UCI ML repository.
+
+Source: https://archive.ics.uci.edu/ml/datasets/Communities+and+Crime+Unnormalized#
+
+With variable names: https://github.com/Starignus/AppliedML_Python_Coursera/blob/master/CommViolPredUnnormalizedData.txt
+
+```{r}
+crime <- read.table("CommViolPredUnnormalizedData.txt", 
+                    header = TRUE, 
+                    sep = ",", 
+                    quote = "\"", 
+                    dec = ".", 
+                    fill = TRUE, 
+                    comment.char = "",
+                    na.strings = "?",
+                    stringsAsFactors = default.stringsAsFactors())
+```
+
+Drop some variables.
+
+```{r}
+crime <- select(crime, -c(communityname, 
+                          state, 
+                          countyCode, 
+                          communityCode, 
+                          fold,
+                          murders, murdPerPop,
+                          rapes, rapesPerPop,
+                          robberies, robbbPerPop,
+                          assaults, assaultPerPop,
+                          burglaries, burglPerPop,
+                          larcenies, larcPerPop,
+                          autoTheft, autoTheftPerPop,
+                          arsons, arsonsPerPop,
+                          nonViolPerPop))
+```
+
+Delete variables with many missings.
+
+```{r}
+crime <- select(crime, -contains("Lemas"))
+crime <- select(crime, -contains("Polic"))
+crime <- select(crime, -contains("Offic"))
+crime <- select(crime, -contains("race"))
+crime <- select(crime, -c(RacialMatchCommPol, NumKindsDrugsSeiz))
+```
+
+Apply listwise deletion of missings in the remaining data.
+
+```{r}
+crime <- drop_na(crime)
+```
+
+Plot and summarize the outcome variable.
+
+```{r}
+summary(crime$ViolentCrimesPerPop)
+
+ggplot(crime, aes(ViolentCrimesPerPop)) +
+  geom_histogram(aes(y = stat(density)), binwidth = 50) +
+  stat_function(
+    fun = dnorm, 
+    args = list(mean = mean(crime$ViolentCrimesPerPop), 
+                sd = sd(crime$ViolentCrimesPerPop)), 
+    col = 'red'
+    )
+```
+
+Split the data into a training and a test set.
+
+```{r}
+set.seed(49043)
+inTrain <- createDataPartition(crime$ViolentCrimesPerPop, 
+                               p = .8, 
+                               list = FALSE, 
+                               times = 1)
+
+crime_train <- crime[inTrain,]
+crime_test <- crime[-inTrain,]
+```
+
+## Random Forest and Extra-Trees
+
+Set up the evaluation method.
+
+```{r}
+ctrl  <- trainControl(method = "cv",
+                      number = 10,
+                      verboseIter = TRUE)
+```
+
+Specify the tuning grid.
+
+```{r}
+cols <- ncol(crime_train)
+
+grid <- expand.grid(mtry = c(round(sqrt(cols)),
+                             round(log(cols))),
+                    splitrule = c("variance", "extratrees"),
+                    min.node.size = c(5, 10))
+grid
+```
+
+Run models with `caret`.
+
+```{r}
+set.seed(65948)
+rf <- train(ViolentCrimesPerPop ~ .,
+            data = crime_train,
+            method = "ranger",
+            trControl = ctrl,
+            tuneGrid = grid)
+```
+
+Print results of the tuning process.
+
+```{r}
+rf
+```
+
+## IML
+
+Create the `Predictor()` container. 
+
+```{r}
+X <- crime_train[which(names(crime_train) != "ViolentCrimesPerPop")]
+predictor <- Predictor$new(rf, data = X, y = crime_train$ViolentCrimesPerPop)
+```
+
+### Feature importances
+
+```{r}
+set.seed(92943)
+imp <- FeatureImp$new(predictor, loss = "mse", n.repetitions = 10)
+```
+
+```{r}
+res <- imp$results
+res$feature = factor(res$feature, levels = res$feature[order(res$importance)])
+
+res %>%
+  top_n(10, importance) %>%
+  ggplot(., aes(y = feature, x = importance)) +  
+  geom_segment(aes(y = feature, yend = feature, 
+                   x = importance.05, xend = importance.95), 
+               size = 1.25, color = "darkslategrey") +
+        geom_point(size = 2.5) +
+        scale_x_continuous("Feature Importance (loss: mse)", 
+                           expand = c(0, 0), limits = c(1, 2)) + 
+        scale_y_discrete("") +
+  theme_grey(base_size = 15)
+
+ggsave("varimp.png", width = 6, height = 6)
+```
+
+### Feature interaction
+
+```{r}
+set.seed(92943)
+interact <- Interaction$new(predictor, grid.size = 10)
+```
+
+```{r}
+res <- interact$results
+res$.feature = factor(res$.feature, levels = res$.feature[order(res$.interaction)])
+
+res %>%
+  top_n(10, .interaction) %>%
+  ggplot(aes(y = .feature, x = .interaction)) + geom_point() +
+  geom_segment(aes(yend = .feature, x = 0, xend = .interaction)) +
+  scale_x_continuous("Overall interaction strength") +
+  scale_y_discrete("") +
+  theme_grey(base_size = 15)
+
+ggsave("interact.png", width = 6, height = 6)
+```
+
+### PDP and ICE plots
+
+```{r}
+ice <- FeatureEffect$new(predictor, method = "pdp+ice", 
+                         feature = "PctKidsBornNeverMar",
+                         center.at = min(crime_train$PctKidsBornNeverMar))
+```
+
+```{r}
+plot(ice) +
+  theme_grey(base_size = 15)
+
+ggsave("ice.png", width = 6, height = 6)
+```
+
+### ALE plots
+
+```{r}
+ale <- FeatureEffect$new(predictor, method = "ale", feature = "PctKidsBornNeverMar")
+```
+
+```{r, warning = FALSE, message = FALSE}
+plot(ale) + 
+  scale_y_continuous("ALE of y") +
+  theme_grey(base_size = 15)
+
+ggsave("ale.png", width = 6, height = 6)
+```
+
+### Global surrogate model
+
+```{r}
+set.seed(92943)
+tree <- TreeSurrogate$new(predictor, maxdepth = 2)
+```
+
+```{r}
+plot(tree) +
+  theme_grey(base_size = 15)
+
+ggsave("tree.png", width = 6, height = 6)
+```
+
+### Local surrogate model via LIME
+
+```{r, warning = FALSE, message = FALSE}
+set.seed(92943)
+example <- sample_n(crime_train, 1)
+example
+predict(rf, newdata = example)
+
+lime <- LocalModel$new(predictor, x.interest = example, k = 3)
+lime$results
+#lime$model$beta[1:97,17]
+#lime$model$a0[17]
+```
+
+```{r}
+plot(lime) +
+  scale_x_discrete("") +
+  theme_grey(base_size = 15) +
+  theme(plot.title = element_text(size = 15))
+
+ggsave("lime.png", width = 6, height = 6)
+```
+
+## References
+
+* https://cran.r-project.org/web/packages/iml/index.html
